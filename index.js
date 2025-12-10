@@ -10,7 +10,7 @@ const CONFIG = {
   psTokenUrl: process.env.PS_TOKEN_URL || 'https://americandreamschool.powerschool.com/oauth/access_token',
   psClientId: process.env.PS_CLIENT_ID,       // set these in Cloud Run env vars
   psClientSecret: process.env.PS_CLIENT_SECRET,
-  pageSize: 1000,
+  pageSize: 5000,
   sleepMsBetweenPages: 150,
   scoreEntryDateFloor: '2025-08-01',          // same as GAS
 
@@ -243,14 +243,23 @@ async function postPowerQueryPage(queryName, bodyArgsObj, page, pagesize) {
 async function getAllPowerQueryRows(queryName, bodyArgsObj) {
   const out = [];
   let page = 1;
+  const MAX_PAGES = 200; // safety guard
+
   while (true) {
     console.log(`PowerQuery ${queryName}: fetching page ${page}`);
     const resp = await postPowerQueryPage(queryName, bodyArgsObj || {}, page, CONFIG.pageSize);
     const recs = (resp && resp.record) || [];
     console.log(`PowerQuery ${queryName}: page ${page} returned ${recs.length} records`);
+
     if (!recs.length) break;
     out.push(...recs);
     if (recs.length < CONFIG.pageSize) break;
+
+    if (page >= MAX_PAGES) {
+      console.warn(`PowerQuery ${queryName}: hit MAX_PAGES=${MAX_PAGES}, stopping.`);
+      break;
+    }
+
     await sleep(CONFIG.sleepMsBetweenPages);
     page++;
   }
@@ -679,13 +688,16 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
 
 //Powerschool --> CSV sync function
 
-async function syncCsvsFromPowerSchool(drive) {
+async function syncCsvsFromPowerSchool(drive, scoreEntryStartStr) {
   console.log('PS sync: starting');
+
+  const floorStr = scoreEntryStartStr || CONFIG.scoreEntryDateFloor;
+  console.log(`PS sync: using scoreEntryDateFloor = ${floorStr}`);
 
   // 1) Scores
   const rawScores = await getAllPowerQueryRows(
     CONFIG.queries.score_since,
-    { start_date: CONFIG.scoreEntryDateFloor }
+    { start_date: floorStr }
   );
   console.log(`PS sync: raw scores rows = ${rawScores.length}`);
 
@@ -693,7 +705,6 @@ async function syncCsvsFromPowerSchool(drive) {
   const nonEmpty = scoreRows.filter(r => Object.values(r).some(v => v !== '' && v != null));
   console.log(`PS sync: non-empty scores rows = ${nonEmpty.length}`);
 
-  // Build set of AssignmentSectionID seen in scores
   const sectionIdSet = new Set();
   for (const r of nonEmpty) {
     const v = r.ASSIGNMENTSECTIONID;
@@ -703,22 +714,12 @@ async function syncCsvsFromPowerSchool(drive) {
   }
   console.log(`PS sync: unique section IDs from scores = ${sectionIdSet.size}`);
 
-  // 2) Sections
+  // 2) Sections (same floor)
   const rawSections = await getAllPowerQueryRows(
     CONFIG.queries.section_by_score_since,
-    { start_date: CONFIG.scoreEntryDateFloor }
+    { start_date: floorStr }
   );
   console.log(`PS sync: raw sections rows = ${rawSections.length}`);
-
-  let sectionRows = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
-
-  // Restrict sections to those that actually have scores
-  if (sectionIdSet.size) {
-    sectionRows = sectionRows.filter(r =>
-      sectionIdSet.has(String(r.AssignmentSectionID || r.ASSIGNMENTSECTIONID || ''))
-    );
-  }
-  console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
 
   // 3) Write CSVs into exports folder
   const folderId = await findExportsFolderId(drive);
@@ -746,37 +747,30 @@ app.get('/run', async (req, res) => {
     const sheets = getSheets(auth);
     const drive = getDrive(auth);
 
-    // 1) Pull fresh data from PowerSchool and regenerate CSVs
-    await syncCsvsFromPowerSchool(drive);
-
-    // 2) Existing quarter build logic from CSVs (unchanged below this line)
+    // Get the current quarter window FIRST
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
 
+    // 1) Pull fresh data from PowerSchool for *this quarter only*
+    await syncCsvsFromPowerSchool(drive, startStr);
+
+    // 2) Existing quarter build logic from CSVs (unchanged)
     const folderId = await findExportsFolderId(drive);
     const scoresCsvId   = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.scores);
     const sectionsCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.sections);
-    if (!scoresCsvId || !sectionsCsvId) throw new Error('Required CSVs not found. Run CSV sync first.');
+    if (!scoresCsvId || !sectionsCsvId) throw new Error('Required CSV files not found in Drive folder.');
 
-    const sectionsCsv = await downloadCsvText(drive, sectionsCsvId);
-    const scoresCsv   = await downloadCsvText(drive, scoresCsvId);
+    const scoresCsv   = await downloadFileAsString(drive, scoresCsvId);
+    const sectionsCsv = await downloadFileAsString(drive, sectionsCsvId);
 
-    const { sectionsFiltered, sectionIdSet } =
-      readAndFilterSectionsCsvByDueDate(sectionsCsv, start, end);
-    const scoresFiltered =
-      readScoresCsvBySectionIdSet(scoresCsv, sectionIdSet);
-
-    console.log(`Filtered sections: ${sectionsFiltered.length}, scores: ${scoresFiltered.length}`);
-
-    await writeSheetRebuild(sheets, 'AssignmentSectionQuarterSpecific', H_ASSIGNMENTSECTION, sectionsFiltered);
-    await writeSheetRebuild(sheets, 'AssignmentScore', H_ASSIGNMENTSCORE, scoresFiltered);
+    await writeQuarterToSheets(sheets, scoresCsv, sectionsCsv, start, end);
 
     const ms = Date.now() - started;
-    const msg = `Quarter build complete: sections=${sectionsFiltered.length}, scores=${scoresFiltered.length}, ms=${ms}`;
+    const msg = `Quarter build complete: ${startStr} .. ${endStr} in ${ms}ms`;
     console.log(msg);
     res.status(200).send(msg);
   } catch (err) {
-    console.error(err);
+    console.error('Error in /run:', err);
     res.status(500).send(String(err));
   }
 });
