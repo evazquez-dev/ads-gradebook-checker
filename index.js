@@ -726,10 +726,10 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   );
   console.log(`PS sync: non-empty scores rows = ${nonEmpty.length}`);
 
-  // Build set of section IDs we actually care about
+  // Build set of section IDs we care about (from scores)
   const sectionIdSet = new Set();
   for (const r of nonEmpty) {
-    const v = r.ASSIGNMENTSECTIONID;
+    const v = r.ASSIGNMENTSECTIONID;             // from H_ASSIGNMENTSCORE
     if (v !== '' && v != null) {
       sectionIdSet.add(String(v));
     }
@@ -743,10 +743,11 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   );
   console.log(`PS sync: raw sections rows = ${rawSections.length}`);
 
-  // Normalize sections and filter down to those in sectionIdSet
+  // Normalize section rows and filter to only those whose AssignmentSectionID is in the set
   const allSections = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
+
   const sectionRows = allSections.filter(r =>
-    sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
+    sectionIdSet.has(String(r.AssignmentSectionID || ''))
   );
   console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
 
