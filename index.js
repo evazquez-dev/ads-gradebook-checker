@@ -97,8 +97,8 @@ async function readQuarterDates(sheets) {
   return { start, end, startStr, endStr };
 }
 
-async function writeSheetRebuild(sheets, sheetName, headers, objects) {
-  // Fetch spreadsheet to find/delete existing sheet
+async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize = 5000) {
+  // 1) Fetch spreadsheet, delete old sheet (if any), add new sheet
   const ss = await sheets.spreadsheets.get({
     spreadsheetId: SPREADSHEET_ID
   });
@@ -123,17 +123,37 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects) {
 
   const newSheetId = batchResp.data.replies.slice(-1)[0].addSheet.properties.sheetId;
 
-  const values = [
-    headers,
-    ...objects.map(o => headers.map(h => (o[h] == null ? '' : o[h])))
-  ];
-
+  // 2) Write header row
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${sheetName}!A1`,
     valueInputOption: 'RAW',
-    requestBody: { values }
+    requestBody: {
+      values: [headers]
+    }
   });
+
+  // 3) Write body in chunks
+  const total = objects.length;
+  console.log(`writeSheetRebuild(${sheetName}): writing ${total} rows in chunks of ${chunkSize}`);
+
+  let written = 0;
+  for (let i = 0; i < total; i += chunkSize) {
+    const slice = objects.slice(i, i + chunkSize);
+    const values = slice.map(o => headers.map(h => (o[h] == null ? '' : o[h])));
+    const startRow = 2 + i; // header is row 1
+    const range = `${sheetName}!A${startRow}`;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range,
+      valueInputOption: 'RAW',
+      requestBody: { values }
+    });
+
+    written += slice.length;
+    console.log(`writeSheetRebuild(${sheetName}): wrote ${written}/${total}`);
+  }
 
   return newSheetId;
 }
