@@ -186,13 +186,6 @@ async function downloadCsvText(drive, fileId) {
 
 // ==== CSV parsing & filtering ====
 
-function parseCsv(text) {
-  const normalized = text.replace(/\r\n/g, '\n');
-  return parse(normalized, {
-    columns: false,
-    skip_empty_lines: true
-  });
-}
 
 function rowToObjectByHeaders(row, headers) {
   const obj = {};
@@ -203,12 +196,15 @@ function rowToObjectByHeaders(row, headers) {
 }
 
 function readAndFilterSectionsCsvByDueDate(csvText, start, end) {
-  const rows = parseCsv(csvText);
-  if (!rows.length) return { sectionsFiltered: [], sectionIdSet: new Set() };
+  const normalized = csvText.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  if (!lines.length) return { sectionsFiltered: [], sectionIdSet: new Set() };
 
-  const headers = rows[0];
-  const body = rows.slice(1);
+  // Parse header row only
+  const headerRows = parse(lines[0], { columns: false, skip_empty_lines: true });
+  if (!headerRows.length) return { sectionsFiltered: [], sectionIdSet: new Set() };
 
+  const headers = headerRows[0];
   const lower = headers.map(h => String(h || '').toLowerCase());
   const idxMap = {};
   lower.forEach((h, i) => { idxMap[h] = i; });
@@ -237,28 +233,43 @@ function readAndFilterSectionsCsvByDueDate(csvText, start, end) {
   const out = [];
   const sectionIdSet = new Set();
 
-  for (const row of body) {
-    if (!row || !row.length) continue;
+  const BATCH = 5000;
+  let chunk = [];
 
-    const dueRaw = row[iDue];
-    const dueDate = parsePSDate(dueRaw);
-    if (!dueDate) continue;
+  // Process body lines in chunks
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue; // skip empty lines
+    chunk.push(line);
 
-    const dueDay = toUtcDay(dueDate);
-    if (dueDay < startDay || dueDay > endDay) continue;
+    if (chunk.length === BATCH || i === lines.length - 1) {
+      const rows = parse(chunk.join('\n'), { columns: false, skip_empty_lines: true });
+      for (const row of rows) {
+        if (!row || !row.length) continue;
 
-    let sid = '';
-    for (const iId of idIndices) {
-      sid = String(row[iId] ?? '').trim();
-      if (sid) break;
+        const dueRaw = row[iDue];
+        const dueDate = parsePSDate(dueRaw);
+        if (!dueDate) continue;
+
+        const dueDay = toUtcDay(dueDate);
+        if (dueDay < startDay || dueDay > endDay) continue;
+
+        // find section id
+        let sid = '';
+        for (const iId of idIndices) {
+          sid = String(row[iId] ?? '').trim();
+          if (sid) break;
+        }
+        if (!sid) continue;
+
+        const obj = rowToObjectByHeaders(row, headers);
+        obj['ASSIGNMENTSECTIONID'] = obj['ASSIGNMENTSECTIONID'] || sid;
+
+        out.push(obj);
+        sectionIdSet.add(sid);
+      }
+      chunk = [];
     }
-    if (!sid) continue;
-
-    const obj = rowToObjectByHeaders(row, headers);
-    obj['ASSIGNMENTSECTIONID'] = obj['ASSIGNMENTSECTIONID'] || sid;
-
-    out.push(obj);
-    sectionIdSet.add(sid);
   }
 
   return { sectionsFiltered: out, sectionIdSet };
@@ -267,12 +278,15 @@ function readAndFilterSectionsCsvByDueDate(csvText, start, end) {
 function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   if (!sectionIdSet || !sectionIdSet.size) return [];
 
-  const rows = parseCsv(csvText);
-  if (!rows.length) return [];
+  const normalized = csvText.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  if (!lines.length) return [];
 
-  const headers = rows[0];
-  const body = rows.slice(1);
+  // Parse header row
+  const headerRows = parse(lines[0], { columns: false, skip_empty_lines: true });
+  if (!headerRows.length) return [];
 
+  const headers = headerRows[0];
   const lower = headers.map(h => String(h || '').toLowerCase());
   const idxMap = {};
   lower.forEach((h, i) => { idxMap[h] = i; });
@@ -280,28 +294,42 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   const iSidUpper = headers.indexOf('ASSIGNMENTSECTIONID');
   const iSidA = idxMap['assignmentsectionid'];
   const iSidB = idxMap['assignmentscore.assignmentsectionid'];
-
   const idIndices = [iSidUpper, iSidA, iSidB].filter(i => i != null && i >= 0);
+
   if (!idIndices.length) {
     throw new Error('ASSIGNMENTSECTIONID column not found in scores CSV');
   }
 
   const out = [];
-  for (const row of body) {
-    if (!row || !row.length) continue;
+  const BATCH = 5000;
+  let chunk = [];
 
-    let sid = '';
-    for (const iId of idIndices) {
-      sid = String(row[iId] ?? '').trim();
-      if (sid) break;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    chunk.push(line);
+
+    if (chunk.length === BATCH || i === lines.length - 1) {
+      const rows = parse(chunk.join('\n'), { columns: false, skip_empty_lines: true });
+      for (const row of rows) {
+        if (!row || !row.length) continue;
+
+        let sid = '';
+        for (const iId of idIndices) {
+          sid = String(row[iId] ?? '').trim();
+          if (sid) break;
+        }
+        if (!sid) continue;
+        if (!sectionIdSet.has(sid)) continue;
+
+        const obj = rowToObjectByHeaders(row, headers);
+        obj['ASSIGNMENTSECTIONID'] = obj['ASSIGNMENTSECTIONID'] || sid;
+        out.push(obj);
+      }
+      chunk = [];
     }
-    if (!sid) continue;
-    if (!sectionIdSet.has(sid)) continue;
-
-    const obj = rowToObjectByHeaders(row, headers);
-    obj['ASSIGNMENTSECTIONID'] = obj['ASSIGNMENTSECTIONID'] || sid;
-    out.push(obj);
   }
+
   return out;
 }
 
