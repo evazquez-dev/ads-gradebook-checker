@@ -536,6 +536,10 @@ async function downloadCsvText(drive, fileId) {
   return typeof res.data === 'string' ? res.data : res.data.toString('utf8');
 }
 
+async function downloadFileAsString(drive, fileId) {
+  return downloadCsvText(drive, fileId);
+}
+
 // ==== CSV parsing & filtering ====
 
 
@@ -685,25 +689,26 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   return out;
 }
 
-
 //Powerschool --> CSV sync function
 
-async function syncCsvsFromPowerSchool(drive, scoreEntryStartStr) {
+async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   console.log('PS sync: starting');
 
+  // Decide what date floor to use
   let floorStr;
   if (scoreEntryStartDate) {
     // scoreEntryStartDate may be a Date or a string → normalize to Date first
     let d = scoreEntryStartDate;
     if (!(d instanceof Date) || isNaN(d)) {
-      d = parsePSDate(scoreEntryStartDate) || new Date(scoreEntryStartDate);
+      d = parsePSDate(scoreEntryStartDate) || new Date(String(scoreEntryStartDate));
     }
     if (!(d instanceof Date) || isNaN(d)) {
       throw new Error('Could not parse scoreEntryStartDate: ' + scoreEntryStartDate);
     }
-    floorStr = toUtcDay(d);          // <-- yyyy-MM-dd
+    floorStr = toUtcDay(d);          // yyyy-MM-dd for PowerSchool
   } else {
-    floorStr = CONFIG.scoreEntryDateFloor;   // already '2025-08-01'
+    // fall back to static floor in CONFIG
+    floorStr = CONFIG.scoreEntryDateFloor;   // e.g. '2025-08-01'
   }
 
   console.log(`PS sync: using scoreEntryDateFloor = ${floorStr}`);
@@ -711,14 +716,17 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartStr) {
   // 1) Scores
   const rawScores = await getAllPowerQueryRows(
     CONFIG.queries.score_since,
-    { start_date: floorStr }          // <-- now valid format
+    { start_date: floorStr }
   );
   console.log(`PS sync: raw scores rows = ${rawScores.length}`);
 
   const scoreRows = normalizeForHeaders(rawScores, H_ASSIGNMENTSCORE, 'ASSIGNMENTSCORE');
-  const nonEmpty = scoreRows.filter(r => Object.values(r).some(v => v !== '' && v != null));
+  const nonEmpty = scoreRows.filter(r =>
+    Object.values(r).some(v => v !== '' && v != null)
+  );
   console.log(`PS sync: non-empty scores rows = ${nonEmpty.length}`);
 
+  // Build set of section IDs we actually care about
   const sectionIdSet = new Set();
   for (const r of nonEmpty) {
     const v = r.ASSIGNMENTSECTIONID;
@@ -734,6 +742,13 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartStr) {
     { start_date: floorStr }
   );
   console.log(`PS sync: raw sections rows = ${rawSections.length}`);
+
+  // Normalize sections and filter down to those in sectionIdSet
+  const allSections = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
+  const sectionRows = allSections.filter(r =>
+    sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
+  );
+  console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
 
   // 3) Write CSVs into exports folder
   const folderId = await findExportsFolderId(drive);
@@ -764,14 +779,16 @@ app.get('/run', async (req, res) => {
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
 
-    // NOTE: pass the Date object, not the raw string
+    // Pass the Date object as the start date floor
     await syncCsvsFromPowerSchool(drive, start);
 
-    // 2) Existing quarter build logic from CSVs (unchanged)
+    // From here down is your “build quarter from CSVs” logic
     const folderId = await findExportsFolderId(drive);
     const scoresCsvId   = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.scores);
     const sectionsCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.sections);
-    if (!scoresCsvId || !sectionsCsvId) throw new Error('Required CSV files not found in Drive folder.');
+    if (!scoresCsvId || !sectionsCsvId) {
+      throw new Error('Required CSV files not found in Drive folder.');
+    }
 
     const scoresCsv   = await downloadFileAsString(drive, scoresCsvId);
     const sectionsCsv = await downloadFileAsString(drive, sectionsCsvId);
