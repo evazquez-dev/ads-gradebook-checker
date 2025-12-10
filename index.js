@@ -123,7 +123,31 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize 
 
   const newSheetId = batchResp.data.replies.slice(-1)[0].addSheet.properties.sheetId;
 
-  // 2) Write header row
+  // 2) Resize grid to fit all rows/cols we will need
+  const totalRowsNeeded = 1 + objects.length; // header + body
+  const totalColsNeeded = Math.max(headers.length, 1);
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          updateSheetProperties: {
+            properties: {
+              sheetId: newSheetId,
+              gridProperties: {
+                rowCount: Math.max(1000, totalRowsNeeded),
+                columnCount: Math.max(26, totalColsNeeded)
+              }
+            },
+            fields: 'gridProperties(rowCount,columnCount)'
+          }
+        }
+      ]
+    }
+  });
+
+  // 3) Write header row
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${sheetName}!A1`,
@@ -133,7 +157,7 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize 
     }
   });
 
-  // 3) Write body in chunks
+  // 4) Write body in chunks
   const total = objects.length;
   console.log(`writeSheetRebuild(${sheetName}): writing ${total} rows in chunks of ${chunkSize}`);
 
