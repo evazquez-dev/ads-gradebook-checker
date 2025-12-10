@@ -610,6 +610,7 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   return out;
 }
 
+
 //Powerschool --> CSV sync function
 
 async function syncCsvsFromPowerSchool(drive) {
