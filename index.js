@@ -119,22 +119,86 @@ async function getPsBearerToken() {
   return token;
 }
 
+// 🔁 PowerSchool fetch with retries for transient socket/timeouts
 async function psFetchJsonPost(url, bodyObj) {
-  const token = await getPsBearerToken();
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(bodyObj || {})
-  });
+  if (!CONFIG.psClientId || !CONFIG.psClientSecret) {
+    throw new Error('Missing PS_CLIENT_ID or PS_CLIENT_SECRET env vars');
+  }
 
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch (_) {}
-  return { status: res.status, text, json };
+  const maxAttempts = 5;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const basic = Buffer.from(`${CONFIG.psClientId}:${CONFIG.psClientSecret}`).toString('base64');
+
+      // 1) Get bearer token
+      const tokenResp = await fetch(CONFIG.psTokenUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${basic}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: 'grant_type=client_credentials'
+      });
+
+      const tokenText = await tokenResp.text();
+      if (!tokenResp.ok) {
+        throw new Error(`Token POST failed (${tokenResp.status}): ${tokenText}`);
+      }
+
+      let tokenJson;
+      try {
+        tokenJson = tokenText ? JSON.parse(tokenText) : {};
+      } catch (e) {
+        throw new Error(`Token JSON parse failed: ${e.message} — body=${tokenText}`);
+      }
+
+      const token = tokenJson.access_token;
+      if (!token) {
+        throw new Error('Token response missing access_token');
+      }
+
+      // 2) Call PowerQuery endpoint
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(bodyObj || {}),
+        // optional hard timeout (2 minutes per page)
+        signal: AbortSignal.timeout(120000)
+      });
+
+      const text = await resp.text();
+      let json = null;
+      try { json = text ? JSON.parse(text) : null; } catch (_) {}
+
+      return { status: resp.status, ok: resp.ok, text, json };
+    } catch (err) {
+      const msg = String(err && err.message || err || '').toLowerCase();
+      const isSocket    = msg.includes('und_err_socket') || msg.includes('other side closed');
+      const isTimeout   = msg.includes('timeout');
+      const isTransient = isSocket || isTimeout;
+
+      if (attempt >= maxAttempts || !isTransient) {
+        console.error('psFetchJsonPost: giving up', {
+          url,
+          attempt,
+          transient: isTransient,
+          error: String(err)
+        });
+        throw err;
+      }
+
+      const delay = Math.min(5000, 500 * Math.pow(2, attempt - 1)); // 0.5s, 1s, 2s, 4s...
+      console.warn(`psFetchJsonPost: transient error on attempt ${attempt}/${maxAttempts}: ${err}. Retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+
+  throw new Error('psFetchJsonPost: exhausted retries unexpectedly');
 }
 
 //PowerQuery URL + paging helpers
@@ -180,8 +244,10 @@ async function getAllPowerQueryRows(queryName, bodyArgsObj) {
   const out = [];
   let page = 1;
   while (true) {
+    console.log(`PowerQuery ${queryName}: fetching page ${page}`);
     const resp = await postPowerQueryPage(queryName, bodyArgsObj || {}, page, CONFIG.pageSize);
     const recs = (resp && resp.record) || [];
+    console.log(`PowerQuery ${queryName}: page ${page} returned ${recs.length} records`);
     if (!recs.length) break;
     out.push(...recs);
     if (recs.length < CONFIG.pageSize) break;
