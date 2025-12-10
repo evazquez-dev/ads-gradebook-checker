@@ -691,13 +691,27 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
 async function syncCsvsFromPowerSchool(drive, scoreEntryStartStr) {
   console.log('PS sync: starting');
 
-  const floorStr = scoreEntryStartStr || CONFIG.scoreEntryDateFloor;
+  let floorStr;
+  if (scoreEntryStartDate) {
+    // scoreEntryStartDate may be a Date or a string → normalize to Date first
+    let d = scoreEntryStartDate;
+    if (!(d instanceof Date) || isNaN(d)) {
+      d = parsePSDate(scoreEntryStartDate) || new Date(scoreEntryStartDate);
+    }
+    if (!(d instanceof Date) || isNaN(d)) {
+      throw new Error('Could not parse scoreEntryStartDate: ' + scoreEntryStartDate);
+    }
+    floorStr = toUtcDay(d);          // <-- yyyy-MM-dd
+  } else {
+    floorStr = CONFIG.scoreEntryDateFloor;   // already '2025-08-01'
+  }
+
   console.log(`PS sync: using scoreEntryDateFloor = ${floorStr}`);
 
   // 1) Scores
   const rawScores = await getAllPowerQueryRows(
     CONFIG.queries.score_since,
-    { start_date: floorStr }
+    { start_date: floorStr }          // <-- now valid format
   );
   console.log(`PS sync: raw scores rows = ${rawScores.length}`);
 
@@ -747,12 +761,11 @@ app.get('/run', async (req, res) => {
     const sheets = getSheets(auth);
     const drive = getDrive(auth);
 
-    // Get the current quarter window FIRST
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
 
-    // 1) Pull fresh data from PowerSchool for *this quarter only*
-    await syncCsvsFromPowerSchool(drive, startStr);
+    // NOTE: pass the Date object, not the raw string
+    await syncCsvsFromPowerSchool(drive, start);
 
     // 2) Existing quarter build logic from CSVs (unchanged)
     const folderId = await findExportsFolderId(drive);
