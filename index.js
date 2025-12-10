@@ -4,6 +4,30 @@ const { parse } = require('csv-parse/sync');
 
 const app = express();
 
+const CONFIG = {
+  // ---- PowerSchool OAuth / PowerQuery ----
+  psBaseUrl: process.env.PS_BASE_URL || 'https://americandreamschool.powerschool.com',
+  psTokenUrl: process.env.PS_TOKEN_URL || 'https://americandreamschool.powerschool.com/oauth/access_token',
+  psClientId: process.env.PS_CLIENT_ID,       // set these in Cloud Run env vars
+  psClientSecret: process.env.PS_CLIENT_SECRET,
+  pageSize: 1000,
+  sleepMsBetweenPages: 150,
+  scoreEntryDateFloor: '2025-08-01',          // same as GAS
+
+  // query names from your plugin
+  queries: {
+    score_since: 'com.ads.assignments.score_since',
+    section_by_score_since: 'com.ads.assignments.section_by_score_since'
+  },
+
+  // ---- CSV folder + names ----
+  csvFolderName: '_PS_Assignments_Exports',
+  csvNames: {
+    scores:   'AssignmentScore_full.csv',
+    sections: 'AssignmentSection_full.csv'
+  }
+};
+
 // === CONFIG ===
 const SPREADSHEET_ID = '1zPu05Vi6m_kt5PvF0n0caWFJf_P3FGs4qed18493UlA';
 const EXPORT_FOLDER_NAME = '_PS_Assignments_Exports';
@@ -33,7 +57,7 @@ async function getAuthClient() {
   const auth = new google.auth.GoogleAuth({
     scopes: [
       'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/drive.readonly'
+      'https://www.googleapis.com/auth/drive'
     ]
   });
   return auth.getClient();
@@ -45,6 +69,177 @@ function getSheets(auth) {
 
 function getDrive(auth) {
   return google.drive({ version: 'v3', auth });
+}
+
+// PowerSchool helpers
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---- PowerSchool auth (client_credentials) ----
+let psToken = null;
+let psTokenExpiry = 0;
+
+async function getPsBearerToken() {
+  if (psToken && Date.now() < psTokenExpiry - 60000) {
+    return psToken;
+  }
+
+  if (!CONFIG.psClientId || !CONFIG.psClientSecret) {
+    throw new Error('PS_CLIENT_ID or PS_CLIENT_SECRET env vars are not set');
+  }
+
+  const basic = Buffer.from(`${CONFIG.psClientId}:${CONFIG.psClientSecret}`).toString('base64');
+
+  const res = await fetch(CONFIG.psTokenUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${basic}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Token POST failed (${res.status}): ${text}`);
+  }
+
+  let json;
+  try { json = JSON.parse(text); } catch (e) {
+    throw new Error('Token response was not JSON: ' + text);
+  }
+
+  const token = json.access_token;
+  const expiresIn = Math.max(60, Math.min(3600, json.expires_in || 3600));
+  if (!token) throw new Error('Token response missing access_token: ' + text);
+
+  psToken = token;
+  psTokenExpiry = Date.now() + expiresIn * 1000;
+  return token;
+}
+
+async function psFetchJsonPost(url, bodyObj) {
+  const token = await getPsBearerToken();
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(bodyObj || {})
+  });
+
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (_) {}
+  return { status: res.status, text, json };
+}
+
+//PowerQuery URL + paging helpers
+function buildPowerQueryUrl(queryName, qsParams, usePartner) {
+  const base = `${CONFIG.psBaseUrl}${usePartner ? '/ws/partners/query/' : '/ws/schema/query/'}${encodeURIComponent(queryName)}`;
+  const parts = [];
+  Object.keys(qsParams || {}).forEach(k => {
+    const v = qsParams[k];
+    if (v !== undefined && v !== null && v !== '') {
+      parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+    }
+  });
+  return parts.length ? `${base}?${parts.join('&')}` : base;
+}
+
+async function postPowerQueryPage(queryName, bodyArgsObj, page, pagesize) {
+  const attempts = [
+    { usePartner: !!CONFIG.usePartnerQueryEndpoint },
+    { usePartner: !CONFIG.usePartnerQueryEndpoint }
+  ];
+  let lastErr = null;
+
+  for (const a of attempts) {
+    const url = buildPowerQueryUrl(queryName, {
+      page: String(page),
+      pagesize: String(pagesize)
+    }, a.usePartner);
+
+    const res = await psFetchJsonPost(url, bodyArgsObj);
+    if (res.status === 404 || res.status === 405) {
+      lastErr = new Error(`${res.status}: ${res.text}`);
+      continue;
+    }
+    if (res.status >= 200 && res.status < 300) {
+      return res.json;
+    }
+    throw new Error(`POST ${a.usePartner ? 'partners' : 'schema'} failed (${res.status}) ${url}\n${res.text}`);
+  }
+  throw new Error(`All PowerQuery POST attempts failed for "${queryName}" (page ${page}). Last error: ${lastErr}`);
+}
+
+async function getAllPowerQueryRows(queryName, bodyArgsObj) {
+  const out = [];
+  let page = 1;
+  while (true) {
+    const resp = await postPowerQueryPage(queryName, bodyArgsObj || {}, page, CONFIG.pageSize);
+    const recs = (resp && resp.record) || [];
+    if (!recs.length) break;
+    out.push(...recs);
+    if (recs.length < CONFIG.pageSize) break;
+    await sleep(CONFIG.sleepMsBetweenPages);
+    page++;
+  }
+  return out;
+}
+
+//noramlizer & CSV writer (Node version)
+
+function normalizeForHeaders(rows, headers, tablePrefix) {
+  const prefDot = (tablePrefix || '').toLowerCase() + '.';
+
+  return (rows || []).map(r => {
+    const lut = {};
+    Object.keys(r || {}).forEach(k => {
+      const kl = String(k).toLowerCase();
+      lut[kl] = r[k];
+    });
+
+    const out = {};
+    for (const h of headers) {
+      const hl = String(h).toLowerCase();
+      let v =
+        lut[hl] ??
+        lut[prefDot + hl] ??
+        r[h] ??
+        (tablePrefix ? r[tablePrefix + '.' + h] : undefined) ??
+        lut[hl.replace(/\./g, '')];
+
+      out[h] = (v === undefined || v === null) ? '' : v;
+    }
+    return out;
+  });
+}
+
+function csvEscape(val) {
+  if (val === null || val === undefined) return '';
+  const s = String(val);
+  if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function objectsToCsv(headers, rows) {
+  const lines = [];
+  lines.push(headers.join(','));
+  const BATCH = 20000;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const slice = rows.slice(i, i + BATCH);
+    for (const r of slice) {
+      const line = headers.map(h => csvEscape(r[h])).join(',');
+      lines.push(line);
+    }
+  }
+  return lines.join('\n');
 }
 
 // ==== Utility date helpers (ported from GAS) ====
@@ -197,17 +392,55 @@ async function findExportsFolderId(drive) {
   const parentId = await getSpreadsheetParentFolderId(drive);
 
   const res = await drive.files.list({
-    q: `'${parentId}' in parents and name = '${EXPORT_FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    q: `'${parentId}' in parents and name = '${CONFIG.csvFolderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
     pageSize: 1,
     fields: 'files(id, name)'
   });
 
   const files = res.data.files || [];
-  if (!files.length) {
-    throw new Error(`Exports folder "${EXPORT_FOLDER_NAME}" not found under spreadsheet parent.`);
+  if (files.length) {
+    return files[0].id;
   }
-  return files[0].id;
+
+  // create if missing
+  const createRes = await drive.files.create({
+    requestBody: {
+      name: CONFIG.csvFolderName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId]
+    },
+    fields: 'id, name'
+  });
+  console.log(`Created exports folder: ${CONFIG.csvFolderName} (id=${createRes.data.id})`);
+  return createRes.data.id;
 }
+
+async function overwriteCsvFileInFolder(drive, folderId, name, csvString) {
+  // delete any existing file with this name
+  const list = await drive.files.list({
+    q: `'${folderId}' in parents and name = '${name}' and trashed = false`,
+    fields: 'files(id)'
+  });
+  for (const f of (list.data.files || [])) {
+    await drive.files.delete({ fileId: f.id });
+  }
+
+  // create new
+  const createRes = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: 'text/csv',
+      parents: [folderId]
+    },
+    media: {
+      mimeType: 'text/csv',
+      body: csvString
+    },
+    fields: 'id, name'
+  });
+  console.log(`Wrote CSV ${name} (id=${createRes.data.id})`);
+}
+
 
 async function getFileIdByNameInFolder(drive, folderId, name) {
   const res = await drive.files.list({
@@ -377,6 +610,61 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   return out;
 }
 
+//Powerschool --> CSV sync function
+
+async function syncCsvsFromPowerSchool(drive) {
+  console.log('PS sync: starting');
+
+  // 1) Scores
+  const rawScores = await getAllPowerQueryRows(
+    CONFIG.queries.score_since,
+    { start_date: CONFIG.scoreEntryDateFloor }
+  );
+  console.log(`PS sync: raw scores rows = ${rawScores.length}`);
+
+  const scoreRows = normalizeForHeaders(rawScores, H_ASSIGNMENTSCORE, 'ASSIGNMENTSCORE');
+  const nonEmpty = scoreRows.filter(r => Object.values(r).some(v => v !== '' && v != null));
+  console.log(`PS sync: non-empty scores rows = ${nonEmpty.length}`);
+
+  // Build set of AssignmentSectionID seen in scores
+  const sectionIdSet = new Set();
+  for (const r of nonEmpty) {
+    const v = r.ASSIGNMENTSECTIONID;
+    if (v !== '' && v != null) {
+      sectionIdSet.add(String(v));
+    }
+  }
+  console.log(`PS sync: unique section IDs from scores = ${sectionIdSet.size}`);
+
+  // 2) Sections
+  const rawSections = await getAllPowerQueryRows(
+    CONFIG.queries.section_by_score_since,
+    { start_date: CONFIG.scoreEntryDateFloor }
+  );
+  console.log(`PS sync: raw sections rows = ${rawSections.length}`);
+
+  let sectionRows = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
+
+  // Restrict sections to those that actually have scores
+  if (sectionIdSet.size) {
+    sectionRows = sectionRows.filter(r =>
+      sectionIdSet.has(String(r.AssignmentSectionID || r.ASSIGNMENTSECTIONID || ''))
+    );
+  }
+  console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
+
+  // 3) Write CSVs into exports folder
+  const folderId = await findExportsFolderId(drive);
+
+  const scoresCsv = objectsToCsv(H_ASSIGNMENTSCORE, nonEmpty);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.scores, scoresCsv);
+
+  const sectionsCsv = objectsToCsv(H_ASSIGNMENTSECTION, sectionRows);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.sections, sectionsCsv);
+
+  console.log('PS sync: done');
+}
+
 // ==== Express routes ====
 
 app.get('/', (req, res) => {
@@ -391,20 +679,20 @@ app.get('/run', async (req, res) => {
     const sheets = getSheets(auth);
     const drive = getDrive(auth);
 
+    // 1) Pull fresh data from PowerSchool and regenerate CSVs
+    await syncCsvsFromPowerSchool(drive);
+
+    // 2) Existing quarter build logic from CSVs (unchanged below this line)
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
 
     const folderId = await findExportsFolderId(drive);
+    const scoresCsvId   = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.scores);
+    const sectionsCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.sections);
+    if (!scoresCsvId || !sectionsCsvId) throw new Error('Required CSVs not found. Run CSV sync first.');
 
-    const scoresId = await getFileIdByNameInFolder(drive, folderId, SCORES_CSV_NAME);
-    const sectionsId = await getFileIdByNameInFolder(drive, folderId, SECTIONS_CSV_NAME);
-
-    if (!scoresId || !sectionsId) {
-      throw new Error(`Missing CSVs. scoresId=${scoresId}, sectionsId=${sectionsId}`);
-    }
-
-    const sectionsCsv = await downloadCsvText(drive, sectionsId);
-    const scoresCsv = await downloadCsvText(drive, scoresId);
+    const sectionsCsv = await downloadCsvText(drive, sectionsCsvId);
+    const scoresCsv   = await downloadCsvText(drive, scoresCsvId);
 
     const { sectionsFiltered, sectionIdSet } =
       readAndFilterSectionsCsvByDueDate(sectionsCsv, start, end);
