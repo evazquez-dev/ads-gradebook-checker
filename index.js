@@ -475,42 +475,65 @@ function csvToObjects(csvString, headers) {
 
 // ==== Quarter builder from CSVs ====
 
-async function writeQuarterToSheets(sheets, scoresCsv, sectionsCsv, start, end) {
-  console.log('writeQuarterToSheets: parsing CSVs');
+function writeQuarterToSheets(sheets, scoresCsv, sectionsCsv, start, end) {
+  console.log('writeQuarterToSheets (DUEDATE-based): parsing CSVs');
 
-  // Parse CSVs into normalized objects
-  const scoreRowsAll   = csvToObjects(scoresCsv,   H_ASSIGNMENTSCORE);
+  // Parse full CSVs using the fixed headers
   const sectionRowsAll = csvToObjects(sectionsCsv, H_ASSIGNMENTSECTION);
+  const scoreRowsAll   = csvToObjects(scoresCsv,   H_ASSIGNMENTSCORE);
 
-  console.log(`writeQuarterToSheets: parsed ${scoreRowsAll.length} score rows, ${sectionRowsAll.length} section rows`);
+  console.log(`writeQuarterToSheets: parsed ${sectionRowsAll.length} section rows, ${scoreRowsAll.length} score rows`);
 
-  // Optional: filter scores to the quarter window using SCOREENTRYDATE
-  const startMs = start.getTime();
-  const endMs   = end.getTime();
+  // --- 1) Filter sections by DUEDATE within [start, end] (inclusive), using day strings ---
+  const startDay = toUtcDay(start);
+  const endDay   = toUtcDay(end);
 
+  const sectionRows = [];
+  const sectionIdSet = new Set();
+
+  for (const row of sectionRowsAll) {
+    const rawDue = String(row.DUEDATE || '').trim();
+    if (!rawDue) continue;
+
+    const dueDate =
+      parsePSDate(rawDue) ||
+      new Date(rawDue) ||
+      null;
+    if (!dueDate || isNaN(dueDate.getTime())) continue;
+
+    const dueDay = toUtcDay(dueDate);
+    if (dueDay < startDay || dueDay > endDay) {
+      continue; // outside the quarter window
+    }
+
+    sectionRows.push(row);
+
+    const sid = String(row.ASSIGNMENTSECTIONID || row.AssignmentSectionID || '').trim();
+    if (sid) sectionIdSet.add(sid);
+  }
+
+  console.log(
+    `writeQuarterToSheets: sections inside DUEDATE window=${sectionRows.length}, sectionIdSet size=${sectionIdSet.size}`
+  );
+
+  // --- 2) Filter scores by ASSIGNMENTSECTIONID ∈ sectionIdSet (no date filter) ---
   const scoreRows = scoreRowsAll.filter(r => {
-    const dStr = (r.SCOREENTRYDATE || '').trim();
-    if (!dStr) return false; // drop rows with no score date
-    const d = parsePSDate(dStr) || new Date(dStr);
-    if (!d || isNaN(d.getTime())) return false;
-    const t = d.getTime();
-    return t >= startMs && t <= endMs;
+    const sid = String(r.ASSIGNMENTSECTIONID || '').trim();
+    return sid && sectionIdSet.has(sid);
   });
 
-  console.log(`writeQuarterToSheets: ${scoreRows.length} score rows inside quarter window`);
+  console.log(`writeQuarterToSheets: scores matching quarter sections=${scoreRows.length}`);
 
-  // For sections we typically keep all of them that appear in the CSV
-  const sectionRows = sectionRowsAll;
+  // --- 3) Rebuild the quarter-specific sheets (same names as GAS) ---
+  const sectionSheetName = 'AssignmentSectionQuarterSpecific';
+  const scoreSheetName   = 'AssignmentScore';
 
-  // Now rebuild two sheets in the spreadsheet with these rows
-  // You can change these sheet names if your spreadsheet expects others.
-  const scoreSheetName    = 'AssignmentScore_full';
-  const sectionSheetName  = 'AssignmentSection_full';
-
-  await writeSheetRebuild(sheets, scoreSheetName,   H_ASSIGNMENTSCORE,   scoreRows);
-  await writeSheetRebuild(sheets, sectionSheetName, H_ASSIGNMENTSECTION, sectionRows);
-
-  console.log('writeQuarterToSheets: sheets rebuilt successfully');
+  return Promise.all([
+    writeSheetRebuild(sheets, sectionSheetName, H_ASSIGNMENTSECTION, sectionRows),
+    writeSheetRebuild(sheets, scoreSheetName,   H_ASSIGNMENTSCORE,   scoreRows),
+  ]).then(() => {
+    console.log('writeQuarterToSheets: quarter sheets rebuilt successfully');
+  });
 }
 
 // ==== Drive helpers ====
@@ -820,7 +843,7 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   const allSections = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
 
   const sectionRows = allSections.filter(r =>
-  sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
+    sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
   );
 
   console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
