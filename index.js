@@ -452,6 +452,67 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize 
   return newSheetId;
 }
 
+// ==== CSV -> objects helpers ====
+
+function csvToObjects(csvString, headers) {
+  if (!csvString || !csvString.trim()) return [];
+
+  const records = parse(csvString, {
+    columns: true,           // use header row
+    skip_empty_lines: true,
+    trim: true
+  });
+
+  // Normalize to our known headers so we always have consistent keys
+  return records.map(rec => {
+    const obj = {};
+    for (const h of headers) {
+      obj[h] = rec[h] == null ? '' : rec[h];
+    }
+    return obj;
+  });
+}
+
+// ==== Quarter builder from CSVs ====
+
+async function writeQuarterToSheets(sheets, scoresCsv, sectionsCsv, start, end) {
+  console.log('writeQuarterToSheets: parsing CSVs');
+
+  // Parse CSVs into normalized objects
+  const scoreRowsAll   = csvToObjects(scoresCsv,   H_ASSIGNMENTSCORE);
+  const sectionRowsAll = csvToObjects(sectionsCsv, H_ASSIGNMENTSECTION);
+
+  console.log(`writeQuarterToSheets: parsed ${scoreRowsAll.length} score rows, ${sectionRowsAll.length} section rows`);
+
+  // Optional: filter scores to the quarter window using SCOREENTRYDATE
+  const startMs = start.getTime();
+  const endMs   = end.getTime();
+
+  const scoreRows = scoreRowsAll.filter(r => {
+    const dStr = (r.SCOREENTRYDATE || '').trim();
+    if (!dStr) return false; // drop rows with no score date
+    const d = parsePSDate(dStr) || new Date(dStr);
+    if (!d || isNaN(d.getTime())) return false;
+    const t = d.getTime();
+    return t >= startMs && t <= endMs;
+  });
+
+  console.log(`writeQuarterToSheets: ${scoreRows.length} score rows inside quarter window`);
+
+  // For sections we typically keep all of them that appear in the CSV
+  const sectionRows = sectionRowsAll;
+
+  // Now rebuild two sheets in the spreadsheet with these rows
+  // You can change these sheet names if your spreadsheet expects others.
+  const scoreSheetName    = 'AssignmentScore_full';
+  const sectionSheetName  = 'AssignmentSection_full';
+
+  await writeSheetRebuild(sheets, scoreSheetName,   H_ASSIGNMENTSCORE,   scoreRows);
+  await writeSheetRebuild(sheets, sectionSheetName, H_ASSIGNMENTSECTION, sectionRows);
+
+  console.log('writeQuarterToSheets: sheets rebuilt successfully');
+}
+
 // ==== Drive helpers ====
 
 async function getSpreadsheetParentFolderId(drive) {
@@ -759,8 +820,9 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   const allSections = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
 
   const sectionRows = allSections.filter(r =>
-    sectionIdSet.has(String(r.AssignmentSectionID || ''))
+  sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
   );
+
   console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
 
   // 3) Write CSVs into exports folder
