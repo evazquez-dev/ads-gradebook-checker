@@ -529,7 +529,6 @@ async function overwriteCsvFileInFolder(drive, folderId, name, csvString) {
   }
 }
 
-
 async function getFileIdByNameInFolder(drive, folderId, name) {
   const res = await drive.files.list({
     q: `'${folderId}' in parents and name = '${name}' and trashed = false`,
