@@ -16,15 +16,23 @@ const CONFIG = {
 
   // query names from your plugin
   queries: {
-    score_since: 'com.ads.assignments.score_since',
-    section_by_score_since: 'com.ads.assignments.section_by_score_since'
+    score_since:               'com.ads.assignments.score_since',
+    section_by_score_since:    'com.ads.assignments.section_by_score_since',
+    catassoc_by_score_since:   'com.ads.assignments.catassoc_by_score_since',
+    teacher_category_all:      'com.ads.assignments.teacher_category_all',
+    district_teacher_category_all: 'com.ads.assignments.district_teacher_category_all',
+    students_id_dcid_all:      'com.ads.assignments.students_id_dcid_all'
   },
 
   // ---- CSV folder + names ----
   csvFolderName: '_PS_Assignments_Exports',
   csvNames: {
-    scores:   'AssignmentScore_full.csv',
-    sections: 'AssignmentSection_full.csv'
+    scores:        'AssignmentScore_full.csv',
+    sections:      'AssignmentSection_full.csv',
+    catassoc:      'AssignmentCategoryAssoc_full.csv',
+    teacherCat:    'TeacherCategory_full.csv',
+    districtCat:   'DistrictTeacherCategory_full.csv',
+    students:      'StudentDCID_full.csv'
   }
 };
 
@@ -49,6 +57,31 @@ const H_ASSIGNMENTSCORE = [
   'HASRETAKE','IP_ADDRESS','ISABSENT','ISCOLLECTED','ISEXEMPT','ISINCOMPLETE','ISLATE','ISMISSING',
   'SCOREENTRYDATE','SCOREGRADESCALEDCID','SCORELETTERGRADE','SCORENUMERICGRADE','SCOREPERCENT',
   'SCOREPOINTS','STUDENTSDCID','TRANSACTION_DATE','WHOMODIFIEDID','WHOMODIFIEDTYPE','YEARID'
+];
+
+const H_ASSIGNMENTCATEGORYASSOC = [
+  'AssignmentCategoryAssocID','ASSIGNMENTSECTIONID','EXECUTIONID','IP_ADDRESS','ISPRIMARY',
+  'TEACHERCATEGORYID','TRANSACTION_DATE','WHOMODIFIEDID','WHOMODIFIEDTYPE','YEARID'
+];
+
+const H_TEACHERCATEGORY = [
+  'CATEGORYTYPE','COLOR','DEFAULTDAYSBEFOREDUE','DEFAULTEXTRACREDITPOINTS','DEFAULTPUBLISHOPTION',
+  'DEFAULTPUBLISHSTATE','DEFAULTSCOREENTRYPOINTS','DEFAULTSCORETYPE','DEFAULTTOTALVALUE','DEFAULTWEIGHT',
+  'DESCRIPTION','DISPLAYPOSITION','DISTRICTTeacherCategoryID','EXECUTIONID','IP_ADDRESS','ISACTIVE',
+  'ISDEFAULTPUBLISHSCORES','ISINFINALGRADES','ISUSERMODIFIABLE','NAME','TeacherCategoryID',
+  'TEACHERMODIFIED','TRANSACTION_DATE','USERSDCID','WHOMODIFIEDID','WHOMODIFIEDTYPE'
+];
+
+const H_DISTRICTTEACHERCATEGORY = [
+  'COLOR','DEFAULTDAYSBEFOREDUE','DEFAULTEXTRACREDITPOINTS','DEFAULTPUBLISHOPTION','DEFAULTPUBLISHSTATE',
+  'DEFAULTSCOREENTRYPOINTS','DEFAULTSCORETYPE','DEFAULTTOTALVALUE','DEFAULTWEIGHT','DESCRIPTION',
+  'DISPLAYPOSITION','DistrictTeacherCategoryID','EXECUTIONID','IP_ADDRESS','ISACTIVE',
+  'ISDEFAULTPUBLISHSCORES','ISINFINALGRADES','ISUSERMODIFIABLE','NAME','TRANSACTION_DATE',
+  'WHOMODIFIEDID','WHOMODIFIEDTYPE'
+];
+
+const H_STUDENTS = [
+  'ID','DCID'
 ];
 
 // ==== Auth helpers ====
@@ -785,6 +818,52 @@ function readScoresCsvBySectionIdSet(csvText, sectionIdSet) {
   return out;
 }
 
+async function getSectionIdsFromQuarterTab(sheets) {
+  const sheetName = 'AssignmentSectionQuarterSpecific';
+
+  // Read the whole sheet (it’s not massive; this is fine)
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${sheetName}!A1:ZZ`
+  });
+
+  const values = res.data.values || [];
+  if (!values.length) {
+    console.log('getSectionIdsFromQuarterTab: sheet empty');
+    return new Set();
+  }
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const lower   = headers.map(h => h.toLowerCase());
+
+  // Try to find ASSIGNMENTSECTIONID column by tolerant names
+  const candidates = [
+    'assignmentsectionid',
+    'assignmentsection.assignmentsectionid'
+  ];
+  let colIdx = headers.indexOf('ASSIGNMENTSECTIONID'); // exact first
+  if (colIdx === -1) {
+    for (const c of candidates) {
+      const i = lower.indexOf(c);
+      if (i !== -1) { colIdx = i; break; }
+    }
+  }
+  if (colIdx === -1) {
+    console.log('getSectionIdsFromQuarterTab: ASSIGNMENTSECTIONID column not found');
+    return new Set();
+  }
+
+  const ids = new Set();
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r] || [];
+    const v   = String(row[colIdx] ?? '').trim();
+    if (v) ids.add(v);
+  }
+
+  console.log(`getSectionIdsFromQuarterTab: collected ${ids.size} section IDs`);
+  return ids;
+}
+
 //Powerschool --> CSV sync function
 
 async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
@@ -858,7 +937,119 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   const sectionsCsv = objectsToCsv(H_ASSIGNMENTSECTION, sectionRows);
   await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.sections, sectionsCsv);
 
+  // 4) Extra CSVs to fully mirror cron_syncCsvs
+  await sync_AssignmentCategoryAssoc_ToCsv(drive, floorStr);
+  await sync_TeacherCategory_ToCsv(drive);
+  await sync_DistrictTeacherCategory_ToCsv(drive);
+  await sync_Students_ToCsv(drive);
+
   console.log('PS sync: done');
+}
+
+// --- Extra CSV syncs to mirror cron_syncCsvs in GAS ---
+
+async function sync_AssignmentCategoryAssoc_ToCsv(drive, floorStr) {
+  console.log('PS sync: pulling AssignmentCategoryAssoc (date-floor only)');
+  const raw = await getAllPowerQueryRows(
+    CONFIG.queries.catassoc_by_score_since,
+    { start_date: floorStr }
+  );
+  const rows = normalizeForHeaders(raw, H_ASSIGNMENTCATEGORYASSOC, 'ASSIGNMENTCATEGORYASSOC');
+  const csv  = objectsToCsv(H_ASSIGNMENTCATEGORYASSOC, rows);
+  const folderId = await findExportsFolderId(drive);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.catassoc, csv);
+  console.log(`PS sync: AssignmentCategoryAssoc CSV written, rows=${rows.length}`);
+}
+
+async function sync_TeacherCategory_ToCsv(drive) {
+  console.log('PS sync: pulling TeacherCategory (all)');
+  const raw  = await getAllPowerQueryRows(CONFIG.queries.teacher_category_all, {});
+  const rows = normalizeForHeaders(raw, H_TEACHERCATEGORY, 'TEACHERCATEGORY');
+  const csv  = objectsToCsv(H_TEACHERCATEGORY, rows);
+  const folderId = await findExportsFolderId(drive);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.teacherCat, csv);
+  console.log(`PS sync: TeacherCategory CSV written, rows=${rows.length}`);
+}
+
+async function sync_DistrictTeacherCategory_ToCsv(drive) {
+  console.log('PS sync: pulling DistrictTeacherCategory (all)');
+  const raw  = await getAllPowerQueryRows(CONFIG.queries.district_teacher_category_all, {});
+  const rows = normalizeForHeaders(raw, H_DISTRICTTEACHERCATEGORY, 'DISTRICTTEACHERCATEGORY');
+  const csv  = objectsToCsv(H_DISTRICTTEACHERCATEGORY, rows);
+  const folderId = await findExportsFolderId(drive);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.districtCat, csv);
+  console.log(`PS sync: DistrictTeacherCategory CSV written, rows=${rows.length}`);
+}
+
+async function sync_Students_ToCsv(drive) {
+  console.log('PS sync: pulling Students (ID/DCID)');
+  const raw  = await getAllPowerQueryRows(CONFIG.queries.students_id_dcid_all, {});
+  const rows = normalizeForHeaders(raw, H_STUDENTS, 'STUDENTS');
+  const csv  = objectsToCsv(H_STUDENTS, rows);
+  const folderId = await findExportsFolderId(drive);
+  await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.students, csv);
+  console.log(`PS sync: StudentDCID CSV written, rows=${rows.length}`);
+}
+
+async function buildReferenceTabsFromCsv(sheets, drive) {
+  console.log('buildReferenceTabsFromCsv: starting');
+
+  const sectionIdSet = await getSectionIdsFromQuarterTab(sheets);
+  const folderId = await findExportsFolderId(drive);
+
+  // --- AssignmentCategoryAssoc (filter by quarter section IDs) ---
+  const catCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.catassoc);
+  if (catCsvId) {
+    const catCsv = await downloadFileAsString(drive, catCsvId);
+    let catRows  = csvToObjects(catCsv, H_ASSIGNMENTCATEGORYASSOC);
+
+    if (sectionIdSet && sectionIdSet.size) {
+      catRows = catRows.filter(r => {
+        const sid = String(r.ASSIGNMENTSECTIONID || r.AssignmentSectionID || '').trim();
+        return sid && sectionIdSet.has(sid);
+      });
+    }
+
+    await writeSheetRebuild(sheets, 'AssignmentCategoryAssoc', H_ASSIGNMENTCATEGORYASSOC, catRows, 5000);
+    console.log(`buildReferenceTabsFromCsv: wrote AssignmentCategoryAssoc rows=${catRows.length}`);
+  } else {
+    console.log('buildReferenceTabsFromCsv: AssignmentCategoryAssoc_full.csv not found; skipping tab.');
+  }
+
+  // --- TeacherCategory (no filter) ---
+  const teachCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.teacherCat);
+  if (teachCsvId) {
+    const teachCsv = await downloadFileAsString(drive, teachCsvId);
+    const rows     = csvToObjects(teachCsv, H_TEACHERCATEGORY);
+    await writeSheetRebuild(sheets, 'TeacherCategory', H_TEACHERCATEGORY, rows, rows.length || 5000);
+    console.log(`buildReferenceTabsFromCsv: wrote TeacherCategory rows=${rows.length}`);
+  } else {
+    console.log('buildReferenceTabsFromCsv: TeacherCategory_full.csv not found; skipping tab.');
+  }
+
+  // --- DistrictTeacherCategory (no filter) ---
+  const distCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.districtCat);
+  if (distCsvId) {
+    const distCsv = await downloadFileAsString(drive, distCsvId);
+    const rows    = csvToObjects(distCsv, H_DISTRICTTEACHERCATEGORY);
+    await writeSheetRebuild(sheets, 'DistrictTeacherCategory', H_DISTRICTTEACHERCATEGORY, rows, rows.length || 5000);
+    console.log(`buildReferenceTabsFromCsv: wrote DistrictTeacherCategory rows=${rows.length}`);
+  } else {
+    console.log('buildReferenceTabsFromCsv: DistrictTeacherCategory_full.csv not found; skipping tab.');
+  }
+
+  // --- StudentDCID (no filter) ---
+  const stuCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.students);
+  if (stuCsvId) {
+    const stuCsv = await downloadFileAsString(drive, stuCsvId);
+    const rows   = csvToObjects(stuCsv, H_STUDENTS);
+    await writeSheetRebuild(sheets, 'StudentDCID', H_STUDENTS, rows, rows.length || 5000);
+    console.log(`buildReferenceTabsFromCsv: wrote StudentDCID rows=${rows.length}`);
+  } else {
+    console.log('buildReferenceTabsFromCsv: StudentDCID_full.csv not found; skipping tab.');
+  }
+
+  console.log('buildReferenceTabsFromCsv: done');
 }
 
 // ==== Express routes ====
@@ -913,6 +1104,18 @@ app.get('/run', async (req, res) => {
       return res.status(200).send(msg);
     }
 
+        // --- REF-TABS ONLY: build reference sheets from existing CSVs + quarter tab ---
+    if (mode === 'ref-tabs') {
+      console.log('Mode=ref-tabs: building reference tabs only');
+
+      await buildReferenceTabsFromCsv(sheets, drive);
+
+      const ms = Date.now() - started;
+      const msg = `ref-tabs: reference tabs build finished in ${ms}ms`;
+      console.log(msg);
+      return res.status(200).send(msg);
+    }
+
     // --- FULL RUN (default) ---
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
@@ -931,8 +1134,11 @@ app.get('/run', async (req, res) => {
 
     await writeQuarterToSheets(sheets, scoresCsv, sectionsCsv, start, end);
 
+    // Now mirror cron_buildReferenceTabs from GAS
+    await buildReferenceTabsFromCsv(sheets, drive);
+
     const ms = Date.now() - started;
-    const msg = `Quarter build complete: ${startStr} .. ${endStr} in ${ms}ms`;
+    const msg = `Full build complete (CSVs + quarter tabs + ref tabs): ${startStr} .. ${endStr} in ${ms}ms`;
     console.log(msg);
     res.status(200).send(msg);
   } catch (err) {
