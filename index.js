@@ -491,29 +491,42 @@ async function findExportsFolderId(drive) {
 }
 
 async function overwriteCsvFileInFolder(drive, folderId, name, csvString) {
-  // delete any existing file with this name
+  // Check if file exists
   const list = await drive.files.list({
     q: `'${folderId}' in parents and name = '${name}' and trashed = false`,
     fields: 'files(id)'
   });
-  for (const f of (list.data.files || [])) {
-    await drive.files.delete({ fileId: f.id });
+  
+  const existingFiles = list.data.files || [];
+  
+  if (existingFiles.length > 0) {
+    // Update existing file
+    const fileId = existingFiles[0].id;
+    const updateRes = await drive.files.update({
+      fileId: fileId,
+      media: {
+        mimeType: 'text/csv',
+        body: csvString
+      },
+      fields: 'id, name'
+    });
+    console.log(`Updated CSV ${name} (id=${updateRes.data.id})`);
+  } else {
+    // Create new file
+    const createRes = await drive.files.create({
+      requestBody: {
+        name,
+        mimeType: 'text/csv',
+        parents: [folderId]
+      },
+      media: {
+        mimeType: 'text/csv',
+        body: csvString
+      },
+      fields: 'id, name'
+    });
+    console.log(`Created CSV ${name} (id=${createRes.data.id})`);
   }
-
-  // create new
-  const createRes = await drive.files.create({
-    requestBody: {
-      name,
-      mimeType: 'text/csv',
-      parents: [folderId]
-    },
-    media: {
-      mimeType: 'text/csv',
-      body: csvString
-    },
-    fields: 'id, name'
-  });
-  console.log(`Wrote CSV ${name} (id=${createRes.data.id})`);
 }
 
 
