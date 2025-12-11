@@ -784,18 +784,55 @@ app.get('/', (req, res) => {
 // Main “quarter rebuild” endpoint
 app.get('/run', async (req, res) => {
   const started = Date.now();
+  const mode = String(req.query.mode || '').toLowerCase() || 'full';
+
   try {
     const auth = await getAuthClient();
     const sheets = getSheets(auth);
     const drive = getDrive(auth);
 
+    // --- FAST DRIVE-ONLY TEST MODE ---
+    // Skip PowerSchool entirely; just exercise Drive folder + overwriteCsvFileInFolder.
+    if (mode === 'drive-test') {
+      console.log('Mode=drive-test: testing Drive CSV writes only');
+
+      const folderId = await findExportsFolderId(drive);
+      console.log(`drive-test: exports folder id = ${folderId}`);
+
+      // Tiny fake CSVs that still use the real filenames
+      const scoresCsv = 'ASSIGNMENTSECTIONID,TESTCOL\n123,test-score\n';
+      const sectionsCsv = 'AssignmentSectionID,TESTCOL\n999,test-section\n';
+
+      await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.scores, scoresCsv);
+      await overwriteCsvFileInFolder(drive, folderId, CONFIG.csvNames.sections, sectionsCsv);
+
+      const ms = Date.now() - started;
+      const msg = `drive-test: Drive write test finished in ${ms}ms`;
+      console.log(msg);
+      return res.status(200).send(msg);
+    }
+
+    // --- PS-SYNC ONLY (no sheet rebuild) ---
+    if (mode === 'ps-sync') {
+      console.log('Mode=ps-sync: running PowerSchool → CSV sync only');
+
+      const { start, end, startStr, endStr } = await readQuarterDates(sheets);
+      console.log(`Quarter window: ${startStr} .. ${endStr}`);
+
+      await syncCsvsFromPowerSchool(drive, start);
+
+      const ms = Date.now() - started;
+      const msg = `ps-sync: PowerSchool CSV sync finished for ${startStr} .. ${endStr} in ${ms}ms`;
+      console.log(msg);
+      return res.status(200).send(msg);
+    }
+
+    // --- FULL RUN (default) ---
     const { start, end, startStr, endStr } = await readQuarterDates(sheets);
     console.log(`Quarter window: ${startStr} .. ${endStr}`);
 
-    // Pass the Date object as the start date floor
     await syncCsvsFromPowerSchool(drive, start);
 
-    // From here down is your “build quarter from CSVs” logic
     const folderId = await findExportsFolderId(drive);
     const scoresCsvId   = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.scores);
     const sectionsCsvId = await getFileIdByNameInFolder(drive, folderId, CONFIG.csvNames.sections);
