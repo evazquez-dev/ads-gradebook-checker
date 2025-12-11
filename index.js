@@ -842,9 +842,10 @@ async function syncCsvsFromPowerSchool(drive, scoreEntryStartDate) {
   // Normalize section rows and filter to only those whose AssignmentSectionID is in the set
   const allSections = normalizeForHeaders(rawSections, H_ASSIGNMENTSECTION, 'ASSIGNMENTSECTION');
 
-  const sectionRows = allSections.filter(r =>
-    sectionIdSet.has(String(r.ASSIGNMENTSECTIONID || ''))
-  );
+  const sectionRows = allSections.filter(r => {
+    const sid = String(r.AssignmentSectionID || r.ASSIGNMENTSECTIONID || '').trim();
+    return sid && sectionIdSet.has(sid);
+  });
 
   console.log(`PS sync: filtered sections rows = ${sectionRows.length}`);
 
