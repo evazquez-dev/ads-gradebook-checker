@@ -450,17 +450,17 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize 
     }
   });
 
-  // 3) Write header row
+  // 3) Write header row — USER_ENTERED is fine here, they’re plain text
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${sheetName}!A1`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     requestBody: {
       values: [headers]
     }
   });
 
-  // 4) Write body in chunks
+  // 4) Write body in chunks, letting Sheets auto-type numbers/dates like a CSV import
   const total = objects.length;
   console.log(`writeSheetRebuild(${sheetName}): writing ${total} rows in chunks of ${chunkSize}`);
 
@@ -474,7 +474,7 @@ async function writeSheetRebuild(sheets, sheetName, headers, objects, chunkSize 
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range,
-      valueInputOption: 'RAW',
+      valueInputOption: 'USER_ENTERED',
       requestBody: { values }
     });
 
